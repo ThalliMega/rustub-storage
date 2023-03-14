@@ -15,6 +15,8 @@ Use big-endian.
 
 Currently full zeroed rows are considered uninitialized.
 
+Tables with zero length name are also considered uninitialized.
+
 Offset from current page, based on page.
 
 ### header meta table

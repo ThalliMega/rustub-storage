@@ -17,7 +17,7 @@ pub struct ColumnDef<T: AsRef<str>> {
 pub enum CreateTableError {
     HeaderTableFull,
     TableExists,
-    TableNameTooLong,
+    TableNameInvalid,
     StorageFull,
     ColumnNameTooLong,
 }

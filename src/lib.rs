@@ -14,9 +14,9 @@ pub mod table;
 const PAGE_SIZE: u64 = 4 * 1024;
 const TABLE_NAME_MAX_LEN: u8 = 23;
 const COLUMN_NAME_MAX_LEN: u8 = 28;
-const HEADER_TABLE_ROW_LEN: i64 = 32;
+const HEADER_TABLE_ROW_LEN: u8 = 32;
 const HEADER_TABLE_RECORD_COUNT: u8 = (PAGE_SIZE / HEADER_TABLE_ROW_LEN as u64) as u8;
-const META_TABLE_ROW_LEN: i64 = 32;
+const META_TABLE_ROW_LEN: u8 = 32;
 const META_TABLE_RECORD_COUNT: u8 = (PAGE_SIZE / META_TABLE_ROW_LEN as u64) as u8;
 
 /// The struct used to operate with the underlying file system.
@@ -31,6 +31,8 @@ pub struct Database {
 struct HeaderMeta {
     col_def_offset: i32,
     meta_offset: i32,
+    table_offsets: Vec<i32>,
+    record_offset: u64,
 }
 
 // fn read_str(reader: &mut impl BufRead, max_len: usize) -> io::Result<String> {
@@ -53,13 +55,13 @@ impl Database {
         let mut name = [0; TABLE_NAME_MAX_LEN as usize];
         let mut int32 = [0; 4];
         let mut in_use_pages = HashSet::from([0]);
-        let mut meta_offsets = HashSet::new();
         for _ in 0..HEADER_TABLE_RECORD_COUNT {
             let mut len = [0];
+            let position = reader.stream_position()?;
             reader.read_exact(&mut len)?;
             let len = len[0];
             if len == 0 {
-                reader.seek_relative(HEADER_TABLE_ROW_LEN - 1)?;
+                reader.seek_relative(HEADER_TABLE_ROW_LEN as i64 - 1)?;
             } else {
                 if len > TABLE_NAME_MAX_LEN {
                     return Err(io::Error::new(
@@ -80,14 +82,21 @@ impl Database {
                     HeaderMeta {
                         col_def_offset,
                         meta_offset,
+                        record_offset: position,
+                        table_offsets: Vec::new(),
                     },
                 );
                 in_use_pages.insert(col_def_offset);
-                meta_offsets.insert(meta_offset);
             }
         }
         // now reader should be at 4096
-        for meta_offset in meta_offsets {
+        for HeaderMeta {
+            meta_offset,
+            table_offsets,
+            ..
+        } in header_table.values_mut()
+        {
+            let meta_offset = *meta_offset;
             set_reader_to_head(&mut reader)?;
             reader.seek_relative(PAGE_SIZE as i64 * meta_offset as i64)?;
             for _ in 0..META_TABLE_RECORD_COUNT {
@@ -96,7 +105,9 @@ impl Database {
                 if int32 == [0; 4] {
                     continue;
                 }
-                in_use_pages.insert(i32::from_be_bytes(int32) + meta_offset);
+                let table_offset = i32::from_be_bytes(int32) + meta_offset;
+                in_use_pages.insert(table_offset);
+                table_offsets.push(table_offset);
             }
             in_use_pages.insert(meta_offset);
         }
@@ -139,10 +150,10 @@ impl Database {
         table_def: &[ColumnDef<impl AsRef<str>>],
     ) -> io::Result<()> {
         let name_len = table_name.len();
-        if name_len > 23 {
+        if name_len > 23 || name_len == 0 {
             return Err(io::Error::new(
                 ErrorKind::Other,
-                CreateTableError::TableNameTooLong,
+                CreateTableError::TableNameInvalid,
             ));
         }
         let name_len = name_len as u8;
@@ -155,8 +166,9 @@ impl Database {
         let reader = &mut self.reader;
         let mut cursor = 0;
         set_reader_to_head(reader)?;
-        let mut len = [0];
         while cursor < PAGE_SIZE {
+            let position = reader.stream_position()?;
+            let mut len = [0];
             reader.read_exact(&mut len)?;
             let len = len[0];
             if len == 0 {
@@ -204,6 +216,8 @@ impl Database {
                     HeaderMeta {
                         col_def_offset: offset,
                         meta_offset: 0,
+                        record_offset: position,
+                        table_offsets: Vec::new(),
                     },
                 );
                 return Ok(());
@@ -216,6 +230,19 @@ impl Database {
             ErrorKind::Other,
             CreateTableError::HeaderTableFull,
         ))
+    }
+
+    pub fn delete_table(&mut self, table_name: &str) -> io::Result<()> {
+        if let Some(meta) = self.header_table.get(table_name) {
+            let writer = &mut self.writer;
+            writer.seek(SeekFrom::Start(meta.record_offset))?;
+            writer.write_all(&[0; HEADER_TABLE_ROW_LEN as usize])?;
+            writer.flush()?;
+            self.header_table.remove(table_name);
+            Ok(())
+        } else {
+            Err(io::Error::new(ErrorKind::Other, "table not found"))
+        }
     }
 }
 
