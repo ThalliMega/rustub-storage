@@ -11,13 +11,13 @@ use table::{ColumnDef, CreateTableError};
 
 pub mod table;
 
-const PAGE_SIZE: u64 = 4 * 1024;
+const PAGE_SIZE: u32 = 4 * 1024;
 const TABLE_NAME_MAX_LEN: u8 = 23;
 const COLUMN_NAME_MAX_LEN: u8 = 28;
 const HEADER_TABLE_ROW_LEN: u8 = 32;
-const HEADER_TABLE_RECORD_COUNT: u8 = (PAGE_SIZE / HEADER_TABLE_ROW_LEN as u64) as u8;
+const HEADER_TABLE_RECORD_COUNT: u8 = (PAGE_SIZE / HEADER_TABLE_ROW_LEN as u32) as u8;
 const META_TABLE_ROW_LEN: u8 = 32;
-const META_TABLE_RECORD_COUNT: u8 = (PAGE_SIZE / META_TABLE_ROW_LEN as u64) as u8;
+const META_TABLE_RECORD_COUNT: u8 = (PAGE_SIZE / META_TABLE_ROW_LEN as u32) as u8;
 
 /// The struct used to operate with the underlying file system.
 pub struct Database {
@@ -31,21 +31,10 @@ pub struct Database {
 struct HeaderMeta {
     col_def_offset: i32,
     meta_offset: i32,
+    // relative to meta table
     table_offsets: Vec<i32>,
-    record_offset: u64,
+    header_record_offset: u8,
 }
-
-// fn read_str(reader: &mut impl BufRead, max_len: usize) -> io::Result<String> {
-//     let mut len = [0];
-//     reader.read_exact(&mut len)?;
-//     let len = len[0] as usize;
-//     if len > max_len {
-//         return Err(io::Error::new(ErrorKind::InvalidData, "str overflow"));
-//     }
-//     let mut s = vec![0; len];
-//     reader.read_exact(&mut s)?;
-//     Ok(String::from_utf8_lossy(&s).to_string())
-// }
 
 impl Database {
     /// Open a database file.
@@ -55,24 +44,23 @@ impl Database {
         let mut name = [0; TABLE_NAME_MAX_LEN as usize];
         let mut int32 = [0; 4];
         let mut in_use_pages = HashSet::from([0]);
-        for _ in 0..HEADER_TABLE_RECORD_COUNT {
-            let mut len = [0];
-            let position = reader.stream_position()?;
-            reader.read_exact(&mut len)?;
-            let len = len[0];
-            if len == 0 {
+        for header_record_offset in 0..HEADER_TABLE_RECORD_COUNT {
+            let mut table_name_len = [0];
+            reader.read_exact(&mut table_name_len)?;
+            let table_name_len = table_name_len[0];
+            if table_name_len == 0 {
                 reader.seek_relative(HEADER_TABLE_ROW_LEN as i64 - 1)?;
             } else {
-                if len > TABLE_NAME_MAX_LEN {
+                if table_name_len > TABLE_NAME_MAX_LEN {
                     return Err(io::Error::new(
                         ErrorKind::InvalidData,
                         "table name overflow",
                     ));
                 }
-                let len = len as usize;
-                reader.read_exact(&mut name[0..len])?;
+                let table_name_len = table_name_len as usize;
+                reader.read_exact(&mut name[..table_name_len])?;
                 // implicit transform
-                let name = String::from_utf8_lossy(&mut name[0..len]);
+                let name = String::from_utf8_lossy(&mut name[0..table_name_len]);
                 reader.read_exact(&mut int32)?;
                 let col_def_offset = i32::from_be_bytes(int32);
                 reader.read_exact(&mut int32)?;
@@ -82,11 +70,12 @@ impl Database {
                     HeaderMeta {
                         col_def_offset,
                         meta_offset,
-                        record_offset: position,
+                        header_record_offset,
                         table_offsets: Vec::new(),
                     },
                 );
                 in_use_pages.insert(col_def_offset);
+                in_use_pages.insert(meta_offset);
             }
         }
         // now reader should be at 4096
@@ -98,6 +87,7 @@ impl Database {
         {
             let meta_offset = *meta_offset;
             set_reader_to_head(&mut reader)?;
+            // TODO: overflow
             reader.seek_relative(PAGE_SIZE as i64 * meta_offset as i64)?;
             for _ in 0..META_TABLE_RECORD_COUNT {
                 let mut int32 = [0; 4];
@@ -105,11 +95,11 @@ impl Database {
                 if int32 == [0; 4] {
                     continue;
                 }
-                let table_offset = i32::from_be_bytes(int32) + meta_offset;
-                in_use_pages.insert(table_offset);
+                let table_offset = i32::from_be_bytes(int32);
+                let table_absolute_offset = table_offset + meta_offset;
+                in_use_pages.insert(table_absolute_offset);
                 table_offsets.push(table_offset);
             }
-            in_use_pages.insert(meta_offset);
         }
 
         let writer = BufWriter::new(File::options().write(true).open(path)?);
@@ -156,45 +146,60 @@ impl Database {
                 CreateTableError::TableNameInvalid,
             ));
         }
-        let name_len = name_len as u8;
         if self.header_table.contains_key(table_name) {
             return Err(io::Error::new(
                 ErrorKind::Other,
                 CreateTableError::TableExists,
             ));
         }
+        let name_len = name_len as u8;
         let reader = &mut self.reader;
-        let mut cursor = 0;
+
         set_reader_to_head(reader)?;
-        while cursor < PAGE_SIZE {
-            let position = reader.stream_position()?;
+        for header_record_offset in 0..HEADER_TABLE_RECORD_COUNT {
             let mut len = [0];
             reader.read_exact(&mut len)?;
             let len = len[0];
             if len == 0 {
                 let writer = &mut self.writer;
-                writer.seek(SeekFrom::Start(cursor))?;
+                writer.seek(SeekFrom::Start(
+                    (header_record_offset * HEADER_TABLE_ROW_LEN) as u64,
+                ))?;
                 writer.write_all(&[name_len])?;
                 writer.write_all(table_name.as_bytes())?;
                 // TODO: full scan
-                let mut offset = 0;
-                while offset < i32::MAX {
-                    if !self.in_use_pages.contains(&offset) {
+                let mut def_offset_page = 0;
+                while def_offset_page < i32::MAX {
+                    if !self.in_use_pages.contains(&def_offset_page) {
                         break;
                     }
-                    offset += 1;
+                    def_offset_page += 1;
                 }
-                if offset == i32::MAX {
+                if def_offset_page == i32::MAX {
                     return Err(io::Error::new(
                         ErrorKind::Other,
                         CreateTableError::StorageFull,
                     ));
                 }
                 // def table offset
-                writer.write_all(&offset.to_be_bytes())?;
+                writer.write_all(&def_offset_page.to_be_bytes())?;
+                let mut meta_offset_page = def_offset_page;
+                // TODO: redundant code
+                while meta_offset_page < i32::MAX {
+                    if !self.in_use_pages.contains(&meta_offset_page) {
+                        break;
+                    }
+                    meta_offset_page += 1;
+                }
+                if meta_offset_page == i32::MAX {
+                    return Err(io::Error::new(
+                        ErrorKind::Other,
+                        CreateTableError::StorageFull,
+                    ));
+                }
                 // meta table offset
-                writer.write_all(&[0; 4])?;
-                writer.seek(SeekFrom::Start(offset as u64))?;
+                writer.write_all(&meta_offset_page.to_be_bytes())?;
+                writer.seek(SeekFrom::Start(def_offset_page as u64 * PAGE_SIZE as u64))?;
                 for def in table_def {
                     let name = def.name.as_ref();
                     let len = name.len();
@@ -214,15 +219,14 @@ impl Database {
                 self.header_table.insert(
                     table_name.to_string(),
                     HeaderMeta {
-                        col_def_offset: offset,
-                        meta_offset: 0,
-                        record_offset: position,
+                        col_def_offset: def_offset_page,
+                        meta_offset: meta_offset_page,
+                        header_record_offset,
                         table_offsets: Vec::new(),
                     },
                 );
                 return Ok(());
             }
-            cursor += 32;
         }
 
         // header table full
@@ -233,17 +237,26 @@ impl Database {
     }
 
     pub fn delete_table(&mut self, table_name: &str) -> io::Result<()> {
-        if let Some(meta) = self.header_table.get(table_name) {
+        if let Some(meta) = self.header_table.remove(table_name) {
             let writer = &mut self.writer;
-            writer.seek(SeekFrom::Start(meta.record_offset))?;
+            writer.seek(SeekFrom::Start(
+                (meta.header_record_offset * HEADER_TABLE_ROW_LEN) as u64,
+            ))?;
             writer.write_all(&[0; HEADER_TABLE_ROW_LEN as usize])?;
             writer.flush()?;
-            self.header_table.remove(table_name);
+
+            self.in_use_pages.remove(&meta.col_def_offset);
+            self.in_use_pages.remove(&meta.meta_offset);
+            for table_offset in meta.table_offsets {
+                self.in_use_pages.remove(&(table_offset + meta.meta_offset));
+            }
             Ok(())
         } else {
             Err(io::Error::new(ErrorKind::Other, "table not found"))
         }
     }
+
+    //pub fn get_table_def(&mut self, table_name: &str) -> io::Result<ColumnDef<String>> {}
 }
 
 fn set_reader_to_head<T: Read + Seek>(reader: &mut BufReader<T>) -> io::Result<()> {
