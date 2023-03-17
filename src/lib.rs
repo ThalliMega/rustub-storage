@@ -18,6 +18,8 @@ const HEADER_TABLE_ROW_LEN: u8 = 32;
 const HEADER_TABLE_RECORD_COUNT: u8 = (PAGE_SIZE / HEADER_TABLE_ROW_LEN as u32) as u8;
 const META_TABLE_ROW_LEN: u8 = 32;
 const META_TABLE_RECORD_COUNT: u8 = (PAGE_SIZE / META_TABLE_ROW_LEN as u32) as u8;
+const DEF_TABLE_ROW_LEN: u8 = 32;
+const DEF_TABLE_RECORD_COUNT: u8 = (PAGE_SIZE / DEF_TABLE_ROW_LEN as u32) as u8;
 
 /// The struct used to operate with the underlying file system.
 pub struct Database {
@@ -256,7 +258,38 @@ impl Database {
         }
     }
 
-    //pub fn get_table_def(&mut self, table_name: &str) -> io::Result<ColumnDef<String>> {}
+    pub fn get_table_def(&mut self, table_name: &str) -> io::Result<Vec<ColumnDef<String>>> {
+        if let Some(meta) = self.header_table.get(table_name) {
+            let def_offset = meta.col_def_offset;
+            let reader = &mut self.reader;
+
+            reader.seek(SeekFrom::Start(def_offset as u64 * PAGE_SIZE as u64))?;
+            let mut defs = Vec::new();
+            for _ in 0..DEF_TABLE_RECORD_COUNT {
+                let mut buf = [0; u8::MAX as usize];
+                reader.read_exact(&mut buf[..1])?;
+                let len = buf[0] as usize;
+                if len == 0 {
+                    reader.seek_relative(DEF_TABLE_ROW_LEN as i64 - 1)?;
+                    continue;
+                }
+                reader.read_exact(&mut buf[..len])?;
+                let name = String::from_utf8_lossy(&buf[..len]).to_string();
+                reader.read_exact(&mut buf[..1])?;
+                let column_type = buf[0];
+                reader.read_exact(&mut buf[..2])?;
+                let size = u16::from_be_bytes(buf[..2].try_into().unwrap());
+                defs.push(ColumnDef {
+                    name,
+                    column_type,
+                    size,
+                })
+            }
+            Ok(defs)
+        } else {
+            Err(io::Error::new(ErrorKind::Other, "table not found"))
+        }
+    }
 }
 
 fn set_reader_to_head<T: Read + Seek>(reader: &mut BufReader<T>) -> io::Result<()> {
