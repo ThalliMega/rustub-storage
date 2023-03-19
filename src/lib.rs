@@ -148,11 +148,25 @@ impl Database {
                 CreateTableError::TableNameInvalid,
             ));
         }
+        if table_def.len() > DEF_TABLE_RECORD_COUNT as usize {
+            return Err(io::Error::new(
+                ErrorKind::Other,
+                CreateTableError::TooManyColumns,
+            ));
+        }
         if self.header_table.contains_key(table_name) {
             return Err(io::Error::new(
                 ErrorKind::Other,
                 CreateTableError::TableExists,
             ));
+        }
+        for def in table_def {
+            if def.name.as_ref().len() > COLUMN_NAME_MAX_LEN as usize {
+                return Err(io::Error::new(
+                    ErrorKind::Other,
+                    CreateTableError::ColumnNameTooLong,
+                ));
+            }
         }
         let name_len = name_len as u8;
         let reader = &mut self.reader;
@@ -165,28 +179,15 @@ impl Database {
             if len == 0 {
                 let writer = &mut self.writer;
                 writer.seek(SeekFrom::Start(
-                    (header_record_offset * HEADER_TABLE_ROW_LEN) as u64,
+                    header_record_offset as u64 * HEADER_TABLE_ROW_LEN as u64,
                 ))?;
                 writer.write_all(&[name_len])?;
                 writer.write_all(table_name.as_bytes())?;
                 // TODO: full scan
-                let mut def_offset_page = 0;
-                while def_offset_page < i32::MAX {
-                    if !self.in_use_pages.contains(&def_offset_page) {
-                        break;
-                    }
-                    def_offset_page += 1;
-                }
-                if def_offset_page == i32::MAX {
-                    return Err(io::Error::new(
-                        ErrorKind::Other,
-                        CreateTableError::StorageFull,
-                    ));
-                }
+                let def_offset_page = find_spare_page(&self.in_use_pages)?;
                 // def table offset
                 writer.write_all(&def_offset_page.to_be_bytes())?;
                 let mut meta_offset_page = def_offset_page;
-                // TODO: redundant code
                 while meta_offset_page < i32::MAX {
                     if !self.in_use_pages.contains(&meta_offset_page) {
                         break;
@@ -202,20 +203,24 @@ impl Database {
                 // meta table offset
                 writer.write_all(&meta_offset_page.to_be_bytes())?;
                 writer.seek(SeekFrom::Start(def_offset_page as u64 * PAGE_SIZE as u64))?;
+                self.in_use_pages
+                    .extend([meta_offset_page, def_offset_page]);
+
+                let rest_len = PAGE_SIZE as usize - table_def.len() * DEF_TABLE_ROW_LEN as usize;
                 for def in table_def {
                     let name = def.name.as_ref();
                     let len = name.len();
-                    if len > COLUMN_NAME_MAX_LEN as usize {
-                        return Err(io::Error::new(
-                            ErrorKind::Other,
-                            CreateTableError::ColumnNameTooLong,
-                        ));
-                    }
+
                     writer.write_all(&[len as u8])?;
                     writer.write_all(name.as_bytes())?;
                     writer.write_all(&[def.column_type])?;
                     writer.write_all(&def.size.to_be_bytes())?;
                 }
+                writer.write_all(&vec![0; rest_len])?;
+
+                writer.seek(SeekFrom::Start(meta_offset_page as u64 * PAGE_SIZE as u64))?;
+                writer.write_all(&[0; PAGE_SIZE as usize])?;
+
                 writer.flush()?;
                 // add to header metadata
                 self.header_table.insert(
@@ -290,6 +295,69 @@ impl Database {
             Err(io::Error::new(ErrorKind::Other, "table not found"))
         }
     }
+
+    /// Data length is not checked.
+    /// An incorrect data length may break the table.
+    pub fn insert(&mut self, table_name: &str, data: &[u8]) -> io::Result<()> {
+        let meta = check_table_exists(&self.header_table, table_name)?;
+        let reader = &mut self.reader;
+
+        for record_offset in 0..META_TABLE_RECORD_COUNT {
+            let mut buf = [0; 4];
+            reader.seek(SeekFrom::Start(
+                meta.meta_offset as u64 * PAGE_SIZE as u64
+                    + record_offset as u64 * META_TABLE_ROW_LEN as u64,
+            ))?;
+            reader.read_exact(&mut buf)?;
+            let table_offset = i32::from_be_bytes(buf);
+            if table_offset == 0 {
+                let new_table = find_spare_page(&self.in_use_pages)?;
+                let writer = &mut self.writer;
+                writer.seek(SeekFrom::Start(reader.stream_position()? - 4))?;
+                writer.write_all(&new_table.to_be_bytes())?;
+                writer.seek(SeekFrom::Start(new_table as u64 * PAGE_SIZE as u64))?;
+                self.in_use_pages.insert(new_table);
+                writer.write_all(data)?;
+                writer.write_all(&vec![0; PAGE_SIZE as usize - data.len()])?;
+                writer.flush()?;
+                return Ok(());
+            }
+
+            let mut table_record_offset_byte = 0;
+            let row_len = data.len();
+            reader.seek(SeekFrom::Start(table_offset as u64))?;
+            while table_record_offset_byte < PAGE_SIZE {
+                let mut buf = vec![0; data.len()];
+                reader.read_exact(&mut buf)?;
+                if buf.into_iter().all(|b| b == 0) {
+                    let writer = &mut self.writer;
+                    writer.seek(SeekFrom::Start(
+                        reader.stream_position()? - data.len() as u64,
+                    ))?;
+                    writer.write_all(data)?;
+                    writer.flush()?;
+                    return Ok(());
+                }
+                table_record_offset_byte += row_len as u32;
+            }
+        }
+
+        Err(io::Error::new(
+            ErrorKind::Other,
+            CreateTableError::StorageFull,
+        ))
+    }
+}
+
+fn check_table_exists<'h>(
+    header_table: &'h HashMap<String, HeaderMeta>,
+    table_name: &str,
+) -> io::Result<&'h HeaderMeta> {
+    if let Some(meta) = header_table.get(table_name) {
+        Ok(meta)
+    } else {
+        Err(io::Error::new(ErrorKind::Other, "table not found"))
+    }
 }
 
 fn set_reader_to_head<T: Read + Seek>(reader: &mut BufReader<T>) -> io::Result<()> {
@@ -300,4 +368,22 @@ fn set_reader_to_head<T: Read + Seek>(reader: &mut BufReader<T>) -> io::Result<(
         reader.seek_relative(-pos)?;
     }
     Ok(())
+}
+
+fn find_spare_page(in_use_pages: &HashSet<i32>) -> io::Result<i32> {
+    let mut offset_page = 0;
+    while offset_page < i32::MAX {
+        if !in_use_pages.contains(&offset_page) {
+            break;
+        }
+        offset_page += 1;
+    }
+    if offset_page == i32::MAX {
+        Err(io::Error::new(
+            ErrorKind::Other,
+            CreateTableError::StorageFull,
+        ))
+    } else {
+        Ok(offset_page)
+    }
 }

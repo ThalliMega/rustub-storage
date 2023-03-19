@@ -20,6 +20,7 @@ pub enum CreateTableError {
     TableNameInvalid,
     StorageFull,
     ColumnNameTooLong,
+    TooManyColumns
 }
 
 impl Display for CreateTableError {
