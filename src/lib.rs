@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-use table::{ColumnDef, CreateTableError};
+use table::{ColumnDef, Condition, CreateTableError};
 
 pub mod table;
 
@@ -36,6 +36,7 @@ struct HeaderMeta {
     // relative to meta table
     table_offsets: Vec<i32>,
     header_record_offset: u8,
+    row_len: u16,
 }
 
 impl Database {
@@ -74,6 +75,7 @@ impl Database {
                         meta_offset,
                         header_record_offset,
                         table_offsets: Vec::new(),
+                        row_len: 0,
                     },
                 );
                 in_use_pages.insert(col_def_offset);
@@ -84,13 +86,13 @@ impl Database {
         for HeaderMeta {
             meta_offset,
             table_offsets,
+            col_def_offset,
+            row_len,
             ..
         } in header_table.values_mut()
         {
             let meta_offset = *meta_offset;
-            set_reader_to_head(&mut reader)?;
-            // TODO: overflow
-            reader.seek_relative(PAGE_SIZE as i64 * meta_offset as i64)?;
+            reader.seek(SeekFrom::Start(PAGE_SIZE as u64 * meta_offset as u64))?;
             for _ in 0..META_TABLE_RECORD_COUNT {
                 let mut int32 = [0; 4];
                 reader.read_exact(&mut int32)?;
@@ -101,6 +103,19 @@ impl Database {
                 let table_absolute_offset = table_offset + meta_offset;
                 in_use_pages.insert(table_absolute_offset);
                 table_offsets.push(table_offset);
+            }
+
+            let col_def_offset = *col_def_offset;
+            reader.seek(SeekFrom::Start(PAGE_SIZE as u64 * col_def_offset as u64))?;
+            for _ in 0..DEF_TABLE_RECORD_COUNT {
+                let mut size = [0; 2];
+                reader.seek_relative(DEF_TABLE_ROW_LEN as i64 - 2)?;
+                reader.read_exact(&mut size)?;
+                let size = u16::from_be_bytes(size);
+                if size == 0 {
+                    break;
+                }
+                *row_len += size;
             }
         }
 
@@ -168,6 +183,14 @@ impl Database {
                 ));
             }
         }
+        let row_size: u16 = table_def.into_iter().map(|d| d.size).sum();
+        if row_size as u32 > PAGE_SIZE {
+            return Err(io::Error::new(
+                ErrorKind::Other,
+                CreateTableError::ColumnTooBig,
+            ));
+        }
+
         let name_len = name_len as u8;
         let reader = &mut self.reader;
 
@@ -230,6 +253,7 @@ impl Database {
                         meta_offset: meta_offset_page,
                         header_record_offset,
                         table_offsets: Vec::new(),
+                        row_len: row_size,
                     },
                 );
                 return Ok(());
@@ -243,7 +267,7 @@ impl Database {
         ))
     }
 
-    pub fn delete_table(&mut self, table_name: &str) -> io::Result<()> {
+    pub fn drop(&mut self, table_name: &str) -> io::Result<()> {
         if let Some(meta) = self.header_table.remove(table_name) {
             let writer = &mut self.writer;
             writer.seek(SeekFrom::Start(
@@ -275,8 +299,9 @@ impl Database {
                 reader.read_exact(&mut buf[..1])?;
                 let len = buf[0] as usize;
                 if len == 0 {
-                    reader.seek_relative(DEF_TABLE_ROW_LEN as i64 - 1)?;
-                    continue;
+                    // reader.seek_relative(DEF_TABLE_ROW_LEN as i64 - 1)?;
+                    // continue;
+                    break;
                 }
                 reader.read_exact(&mut buf[..len])?;
                 let name = String::from_utf8_lossy(&buf[..len]).to_string();
@@ -296,10 +321,16 @@ impl Database {
         }
     }
 
-    /// Data length is not checked.
-    /// An incorrect data length may break the table.
+    /// Data can contain only one row.
     pub fn insert(&mut self, table_name: &str, data: &[u8]) -> io::Result<()> {
         let meta = check_table_exists(&self.header_table, table_name)?;
+        if data.len() != meta.row_len as usize {
+            return Err(io::Error::new(
+                ErrorKind::Other,
+                "data len mismatch: only one row at a time is accepted",
+            ));
+        }
+
         let reader = &mut self.reader;
 
         for record_offset in 0..META_TABLE_RECORD_COUNT {
@@ -346,6 +377,45 @@ impl Database {
             ErrorKind::Other,
             CreateTableError::StorageFull,
         ))
+    }
+
+    pub fn select<T: AsRef<[u8]>>(
+        &mut self,
+        table_name: &str,
+        conditions: &[Condition<T>],
+    ) -> io::Result<Vec<Vec<u8>>> {
+        let meta = check_table_exists(&self.header_table, table_name)?;
+        let reader = &mut self.reader;
+        let mut res = Vec::new();
+
+        for record_number in 0..META_TABLE_RECORD_COUNT {
+            reader.seek(SeekFrom::Start(
+                meta.meta_offset as u64 * PAGE_SIZE as u64
+                    + record_number as u64 * META_TABLE_ROW_LEN as u64,
+            ))?;
+            let mut table_offset = [0; 4];
+            reader.read_exact(&mut table_offset)?;
+            let table_offset = i32::from_be_bytes(table_offset);
+            if table_offset == 0 {
+                continue;
+            }
+
+            reader.seek(SeekFrom::Start(table_offset as u64 * PAGE_SIZE as u64))?;
+            let mut cursor = 0;
+            let mut buf = vec![0; meta.row_len as usize];
+            while cursor < PAGE_SIZE {
+                reader.read_exact(&mut buf)?;
+                if conditions
+                    .into_iter()
+                    .all(|c| &buf[c.range.clone()] == c.eq_to.as_ref())
+                {
+                    res.push(buf.clone());
+                }
+                cursor += meta.row_len as u32;
+            }
+        }
+
+        Ok(res)
     }
 }
 

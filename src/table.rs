@@ -3,6 +3,7 @@
 use std::{
     error::Error,
     fmt::{Debug, Display},
+    ops::Range,
 };
 
 /// Column definition.
@@ -20,7 +21,13 @@ pub enum CreateTableError {
     TableNameInvalid,
     StorageFull,
     ColumnNameTooLong,
-    TooManyColumns
+    TooManyColumns,
+    ColumnTooBig,
+}
+
+pub struct Condition<T: AsRef<[u8]>> {
+    pub range: Range<usize>,
+    pub eq_to: T,
 }
 
 impl Display for CreateTableError {
