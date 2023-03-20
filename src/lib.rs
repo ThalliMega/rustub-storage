@@ -417,6 +417,54 @@ impl Database {
 
         Ok(res)
     }
+
+    pub fn update<C: AsRef<[u8]>, N: AsRef<[u8]>>(
+        &mut self,
+        table_name: &str,
+        conditions: &[Condition<C>],
+        new_value: &[Condition<N>],
+    ) -> io::Result<usize> {
+        let meta = check_table_exists(&self.header_table, table_name)?;
+        let reader = &mut self.reader;
+        let mut res = 0;
+
+        for record_number in 0..META_TABLE_RECORD_COUNT {
+            reader.seek(SeekFrom::Start(
+                meta.meta_offset as u64 * PAGE_SIZE as u64
+                    + record_number as u64 * META_TABLE_ROW_LEN as u64,
+            ))?;
+            let mut table_offset = [0; 4];
+            reader.read_exact(&mut table_offset)?;
+            let table_offset = i32::from_be_bytes(table_offset);
+            if table_offset == 0 {
+                continue;
+            }
+
+            reader.seek(SeekFrom::Start(table_offset as u64 * PAGE_SIZE as u64))?;
+            let mut cursor = 0;
+            let mut buf = vec![0; meta.row_len as usize];
+            while cursor < PAGE_SIZE {
+                reader.read_exact(&mut buf)?;
+                if conditions
+                    .into_iter()
+                    .all(|c| &buf[c.range.clone()] == c.eq_to.as_ref())
+                {
+                    let writer = &mut self.writer;
+                    let start = reader.stream_position()? - meta.row_len as u64;
+
+                    for field in new_value {
+                        writer.seek(SeekFrom::Start(start + field.range.start as u64))?;
+                        writer.write_all(field.eq_to.as_ref())?;
+                    }
+                    res += 1;
+                }
+                cursor += meta.row_len as u32;
+            }
+        }
+        self.writer.flush()?;
+
+        Ok(res)
+    }
 }
 
 fn check_table_exists<'h>(
