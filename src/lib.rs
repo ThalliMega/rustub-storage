@@ -63,7 +63,7 @@ impl Database {
                 let table_name_len = table_name_len as usize;
                 reader.read_exact(&mut name[..table_name_len])?;
                 // implicit transform
-                let name = String::from_utf8_lossy(&mut name[0..table_name_len]);
+                let name = String::from_utf8_lossy(&name[0..table_name_len]);
                 reader.read_exact(&mut int32)?;
                 let col_def_offset = i32::from_be_bytes(int32);
                 reader.read_exact(&mut int32)?;
@@ -183,7 +183,7 @@ impl Database {
                 ));
             }
         }
-        let row_size: u16 = table_def.into_iter().map(|d| d.size).sum();
+        let row_size: u16 = table_def.iter().map(|d| d.size).sum();
         if row_size as u32 > PAGE_SIZE {
             return Err(io::Error::new(
                 ErrorKind::Other,
@@ -406,7 +406,7 @@ impl Database {
             while cursor < PAGE_SIZE {
                 reader.read_exact(&mut buf)?;
                 if conditions
-                    .into_iter()
+                    .iter()
                     .all(|c| &buf[c.range.clone()] == c.eq_to.as_ref())
                 {
                     res.push(buf.clone());
@@ -446,7 +446,7 @@ impl Database {
             while cursor < PAGE_SIZE {
                 reader.read_exact(&mut buf)?;
                 if conditions
-                    .into_iter()
+                    .iter()
                     .all(|c| &buf[c.range.clone()] == c.eq_to.as_ref())
                 {
                     let writer = &mut self.writer;
@@ -459,6 +459,58 @@ impl Database {
                     res += 1;
                 }
                 cursor += meta.row_len as u32;
+            }
+        }
+        self.writer.flush()?;
+
+        Ok(res)
+    }
+
+    pub fn delete<T: AsRef<[u8]>>(
+        &mut self,
+        table_name: &str,
+        conditions: &[Condition<T>],
+    ) -> io::Result<usize> {
+        let meta = check_table_exists(&self.header_table, table_name)?;
+        let reader = &mut self.reader;
+        let mut res = 0;
+
+        for record_number in 0..META_TABLE_RECORD_COUNT {
+            reader.seek(SeekFrom::Start(
+                meta.meta_offset as u64 * PAGE_SIZE as u64
+                    + record_number as u64 * META_TABLE_ROW_LEN as u64,
+            ))?;
+            let mut table_offset = [0; 4];
+            reader.read_exact(&mut table_offset)?;
+            let table_offset = i32::from_be_bytes(table_offset);
+            if table_offset == 0 {
+                continue;
+            }
+
+            reader.seek(SeekFrom::Start(table_offset as u64 * PAGE_SIZE as u64))?;
+            let mut cursor = 0;
+            let mut buf = vec![0; meta.row_len as usize];
+            let mut empty_page = true;
+            while cursor < PAGE_SIZE {
+                reader.read_exact(&mut buf)?;
+                if conditions
+                    .iter()
+                    .all(|c| &buf[c.range.clone()] == c.eq_to.as_ref())
+                {
+                    res += 1;
+                } else if buf.iter().any(|b| *b != 0) {
+                    empty_page = false;
+                }
+                cursor += meta.row_len as u32;
+            }
+            if empty_page {
+                let writer = &mut self.writer;
+                writer.seek(SeekFrom::Start(
+                    meta.meta_offset as u64 * PAGE_SIZE as u64
+                        + record_number as u64 * META_TABLE_ROW_LEN as u64,
+                ))?;
+                writer.write_all(&[0; META_TABLE_ROW_LEN as usize])?;
+                self.in_use_pages.remove(&table_offset);
             }
         }
         self.writer.flush()?;
