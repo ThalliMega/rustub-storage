@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
+    ops::Range,
     path::Path,
 };
 
@@ -407,12 +408,37 @@ impl Database {
                 reader.read_exact(&mut buf)?;
                 if conditions
                     .iter()
-                    .all(|c| &buf[c.range.clone()] == c.eq_to.as_ref())
+                    .all(|c| buf[c.range.clone()].cmp(c.data.as_ref()) == c.ord)
                 {
                     res.push(buf.clone());
                 }
                 cursor += meta.row_len as u32;
             }
+        }
+
+        Ok(res)
+    }
+
+    pub fn select_pos(
+        &mut self,
+        table_name: &str,
+        data_table_page_offset: i32,
+        row_range: Range<i32>,
+    ) -> io::Result<Vec<Vec<u8>>> {
+        let meta = check_table_exists(&self.header_table, table_name)?;
+        let reader = &mut self.reader;
+
+        reader.seek(SeekFrom::Start(
+            data_table_page_offset as u64 * PAGE_SIZE as u64
+                + meta.row_len as u64 * row_range.start as u64,
+        ))?;
+
+        let mut res = Vec::with_capacity((row_range.end - row_range.start) as usize);
+
+        for _ in row_range {
+            let mut r = vec![0; meta.row_len as usize];
+            reader.read_exact(&mut r)?;
+            res.push(r);
         }
 
         Ok(res)
@@ -447,14 +473,14 @@ impl Database {
                 reader.read_exact(&mut buf)?;
                 if conditions
                     .iter()
-                    .all(|c| &buf[c.range.clone()] == c.eq_to.as_ref())
+                    .all(|c| buf[c.range.clone()].cmp(c.data.as_ref()) == c.ord)
                 {
                     let writer = &mut self.writer;
                     let start = reader.stream_position()? - meta.row_len as u64;
 
                     for field in new_value {
                         writer.seek(SeekFrom::Start(start + field.range.start as u64))?;
-                        writer.write_all(field.eq_to.as_ref())?;
+                        writer.write_all(field.data.as_ref())?;
                     }
                     res += 1;
                 }
@@ -464,6 +490,27 @@ impl Database {
         self.writer.flush()?;
 
         Ok(res)
+    }
+
+    pub fn update_pos<T: AsRef<[u8]>>(
+        &mut self,
+        table_name: &str,
+        data_table_page_offset: i32,
+        row_range: Range<i32>,
+        data: T,
+    ) -> io::Result<()> {
+        let meta = check_table_exists(&self.header_table, table_name)?;
+        let writer = &mut self.writer;
+
+        writer.seek(SeekFrom::Start(
+            data_table_page_offset as u64 * PAGE_SIZE as u64
+                + meta.row_len as u64 * row_range.start as u64,
+        ))?;
+
+        for _ in row_range {
+            writer.write_all(data.as_ref())?;
+        }
+        Ok(())
     }
 
     pub fn delete<T: AsRef<[u8]>>(
@@ -495,7 +542,7 @@ impl Database {
                 reader.read_exact(&mut buf)?;
                 if conditions
                     .iter()
-                    .all(|c| &buf[c.range.clone()] == c.eq_to.as_ref())
+                    .all(|c| buf[c.range.clone()].cmp(c.data.as_ref()) == c.ord)
                 {
                     res += 1;
                 } else if buf.iter().any(|b| *b != 0) {
@@ -516,6 +563,26 @@ impl Database {
         self.writer.flush()?;
 
         Ok(res)
+    }
+
+    pub fn delete_pos(
+        &mut self,
+        table_name: &str,
+        data_table_page_offset: i32,
+        row_range: Range<i32>,
+    ) -> io::Result<()> {
+        let meta = check_table_exists(&self.header_table, table_name)?;
+        let writer = &mut self.writer;
+
+        writer.seek(SeekFrom::Start(
+            data_table_page_offset as u64 * PAGE_SIZE as u64
+                + meta.row_len as u64 * row_range.start as u64,
+        ))?;
+
+        for _ in row_range {
+            writer.write_all(&vec![0; meta.row_len as usize])?;
+        }
+        Ok(())
     }
 }
 

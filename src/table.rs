@@ -1,6 +1,7 @@
 //! Table definitions.
 
 use std::{
+    cmp::Ordering,
     error::Error,
     fmt::{Debug, Display},
     ops::Range,
@@ -27,7 +28,9 @@ pub enum CreateTableError {
 
 pub struct Condition<T: AsRef<[u8]>> {
     pub range: Range<usize>,
-    pub eq_to: T,
+    pub data: T,
+    /// Ord between accepted data and condition data.
+    pub ord: Ordering,
 }
 
 impl Display for CreateTableError {
